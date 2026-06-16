@@ -933,6 +933,194 @@ kernel void NAME(                                       \
 }
 
 
+template<typename T, ushort BLOCKSIZE>
+METAL_FUNC void cross_entropy_forward(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device const uint *target,
+    device T *dst,
+    threadgroup MD<T> shared[BLOCKSIZE],
+    threadgroup MD<T> &md_total,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Mdr = MDReduceOp<T>;
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    loader<T, MD<T>, Mdr, BLOCKSIZE, Indexer, uint> load;
+    block_reducer<MD<T>, Mdr, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+    MD<T> md_partial = MD<T> { numeric_limits<T>::lowest(), 0 };
+    md_partial = load(
+        md_partial,
+        indexer,
+        src_numel,
+        el_per_block,
+        src,
+        offset,
+        tid
+    );
+
+    MD<T> md = reduce(md_partial, tid);
+    if (tid == 0) {
+        md_total = md;
+        const uint target_idx = target[dst_id];
+        if (target_idx < el_per_block) {
+            const float logsumexp = static_cast<float>(md_total.m) + fast::log(md_total.d);
+            const float target_val = static_cast<float>(src[offset + target_idx]);
+            dst[dst_id] = static_cast<T>(logsumexp - target_val);
+        } else {
+            dst[dst_id] = static_cast<T>(NAN);
+        }
+    }
+}
+
+#define cross_entropy_forward_case(T, N)                \
+case N: {                                               \
+    threadgroup MD<T> shared[N];                        \
+    threadgroup MD<T> md_total;                         \
+    cross_entropy_forward<T, N>(                        \
+        src_numel,                                      \
+        el_per_block,                                   \
+        src,                                            \
+        target,                                         \
+        dst,                                            \
+        shared,                                         \
+        md_total,                                       \
+        tid,                                            \
+        dst_id);                                        \
+    break;                                              \
+}
+
+#define impl_cross_entropy_forward(NAME, T)             \
+kernel void NAME(                                       \
+    constant uint &src_numel,                           \
+    constant uint &el_per_block,                        \
+    device const T *src,                                \
+    device const uint *target,                          \
+    device T *dst,                                      \
+    uint tid [[ thread_index_in_threadgroup ]],         \
+    uint dst_id [[ threadgroup_position_in_grid ]],     \
+    uint block_dim [[ threads_per_threadgroup ]]        \
+) {                                                     \
+    switch (max_shared_mem<T>(block_dim)) {             \
+        cross_entropy_forward_case(T, 1024);            \
+        cross_entropy_forward_case(T,  512);            \
+        cross_entropy_forward_case(T,  256);            \
+        cross_entropy_forward_case(T,  128);            \
+        cross_entropy_forward_case(T,   64);            \
+        cross_entropy_forward_case(T,   32);            \
+        cross_entropy_forward_case(T,   16);            \
+        cross_entropy_forward_case(T,    8);            \
+        cross_entropy_forward_case(T,    4);            \
+        cross_entropy_forward_case(T,    2);            \
+        cross_entropy_forward_case(T,    1);            \
+    }                                                   \
+}
+
+template<typename T, ushort BLOCKSIZE>
+METAL_FUNC void cross_entropy_backward(
+    constant uint &src_numel,
+    constant uint &el_per_block,
+    device const T *src,
+    device const uint *target,
+    device const T *grad_res,
+    device T *dst,
+    threadgroup MD<T> shared[BLOCKSIZE],
+    threadgroup MD<T> &md_total,
+    uint tid [[ thread_index_in_threadgroup ]],
+    uint dst_id [[ threadgroup_position_in_grid ]]
+) {
+    using Mdr = MDReduceOp<T>;
+    using Indexer = indexer_t<uint, false>;
+    Indexer indexer;
+    loader<T, MD<T>, Mdr, BLOCKSIZE, Indexer, uint> load;
+    block_reducer<MD<T>, Mdr, BLOCKSIZE> reduce(shared);
+
+    const uint offset = dst_id * el_per_block;
+    MD<T> md_partial = MD<T> { numeric_limits<T>::lowest(), 0 };
+    md_partial = load(
+        md_partial,
+        indexer,
+        src_numel,
+        el_per_block,
+        src,
+        offset,
+        tid
+    );
+
+    MD<T> md = reduce(md_partial, tid);
+    if (tid == 0) md_total = md;
+    threadgroup_barrier(mem_flags::mem_none);
+
+    const float inv_d = 1.0 / md_total.d;
+    const float grad_scale = static_cast<float>(grad_res[dst_id]);
+    const uint target_idx = target[dst_id];
+    const bool target_valid = target_idx < el_per_block;
+    const uint thread_id = offset + tid;
+    const uint stop_idx = min(offset + el_per_block, src_numel);
+    for (uint idx = thread_id; idx < stop_idx; idx += BLOCKSIZE) {
+        if (target_valid) {
+            const uint class_idx = idx - offset;
+            float grad = fast::exp(static_cast<float>(src[idx]) - static_cast<float>(md_total.m)) * inv_d;
+            if (class_idx == target_idx) {
+                grad -= 1.0;
+            }
+            dst[idx] = static_cast<T>(grad * grad_scale);
+        } else {
+            dst[idx] = static_cast<T>(NAN);
+        }
+    }
+}
+
+#define cross_entropy_backward_case(T, N)               \
+case N: {                                               \
+    threadgroup MD<T> shared[N];                        \
+    threadgroup MD<T> md_total;                         \
+    cross_entropy_backward<T, N>(                       \
+        src_numel,                                      \
+        el_per_block,                                   \
+        src,                                            \
+        target,                                         \
+        grad_res,                                       \
+        dst,                                            \
+        shared,                                         \
+        md_total,                                       \
+        tid,                                            \
+        dst_id);                                        \
+    break;                                              \
+}
+
+#define impl_cross_entropy_backward(NAME, T)            \
+kernel void NAME(                                       \
+    constant uint &src_numel,                           \
+    constant uint &el_per_block,                        \
+    device const T *src,                                \
+    device const uint *target,                          \
+    device const T *grad_res,                           \
+    device T *dst,                                      \
+    uint tid [[ thread_index_in_threadgroup ]],         \
+    uint dst_id [[ threadgroup_position_in_grid ]],     \
+    uint block_dim [[ threads_per_threadgroup ]]        \
+) {                                                     \
+    switch (max_shared_mem<T>(block_dim)) {             \
+        cross_entropy_backward_case(T, 1024);           \
+        cross_entropy_backward_case(T,  512);           \
+        cross_entropy_backward_case(T,  256);           \
+        cross_entropy_backward_case(T,  128);           \
+        cross_entropy_backward_case(T,   64);           \
+        cross_entropy_backward_case(T,   32);           \
+        cross_entropy_backward_case(T,   16);           \
+        cross_entropy_backward_case(T,    8);           \
+        cross_entropy_backward_case(T,    4);           \
+        cross_entropy_backward_case(T,    2);           \
+        cross_entropy_backward_case(T,    1);           \
+    }                                                   \
+}
+
+
 template<typename T>
 METAL_FUNC void rmsnorm(
     constant size_t &src_numel,
@@ -1526,6 +1714,10 @@ impl_arg_reduce(Max, fast_argmax_u8, uint8_t)
 
 impl_softmax(softmax_f32, float)
 impl_softmax(softmax_f16, half)
+impl_cross_entropy_forward(cross_entropy_fwd_f32, float)
+impl_cross_entropy_forward(cross_entropy_fwd_f16, half)
+impl_cross_entropy_backward(cross_entropy_bwd_f32, float)
+impl_cross_entropy_backward(cross_entropy_bwd_f16, half)
 
 #if __METAL_VERSION__ >= 220
 impl_reduce(Sum, fast_sum_i64, int64_t)
@@ -1547,6 +1739,8 @@ impl_arg_reduce(Min, fast_argmin_bf16, bfloat)
 impl_arg_reduce(Max, fast_argmax_bf16, bfloat)
 
 impl_softmax(softmax_bf16, bfloat)
+impl_cross_entropy_forward(cross_entropy_fwd_bf16, bfloat)
+impl_cross_entropy_backward(cross_entropy_bwd_bf16, bfloat)
 
 impl_rms_norm(rmsnorm_bf16, bfloat)
 impl_layer_norm(layernorm_bf16, bfloat)

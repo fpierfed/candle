@@ -166,6 +166,101 @@ pub fn call_last_softmax(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn call_cross_entropy_forward(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements: usize,
+    input: &Buffer,
+    input_offset: usize,
+    target: &Buffer,
+    target_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements,
+            (input, input_offset),
+            (target, target_offset),
+            Output::new(output)
+        )
+    );
+
+    let out_length = length / elements;
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), elements.next_power_of_two());
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn call_cross_entropy_backward(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: &'static str,
+    length: usize,
+    elements: usize,
+    input: &Buffer,
+    input_offset: usize,
+    target: &Buffer,
+    target_offset: usize,
+    grad_res: &Buffer,
+    grad_res_offset: usize,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Reduce, kernel_name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(
+        encoder,
+        (
+            length,
+            elements,
+            (input, input_offset),
+            (target, target_offset),
+            (grad_res, grad_res_offset),
+            Output::new(output)
+        )
+    );
+
+    let out_length = length / elements;
+    let thread_group_count = MTLSize {
+        width: out_length,
+        height: 1,
+        depth: 1,
+    };
+    let width = std::cmp::min(pipeline.max_total_threads_per_threadgroup(), elements.next_power_of_two());
+    let thread_group_size = MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn call_rms_norm(
     device: &Device,
     ep: impl EncoderProvider,

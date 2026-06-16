@@ -647,7 +647,137 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
     rope_thd<TYPENAME>(src, cos, sin, dst, b, t, h, d, stride_b); \
   } \
 
+template <typename T, typename ACC>
+__device__ void cross_entropy_forward(
+    const size_t numel,
+    const size_t num_classes,
+    const T *src,
+    const uint32_t *target,
+    T *dst)
+{
+    const size_t row = blockIdx.x;
+    const size_t tid = threadIdx.x;
+    const size_t offset = row * num_classes;
+
+    ACC max_val = -INFINITY;
+    for (size_t i = tid; i < num_classes; i += blockDim.x) {
+        max_val = maxg(max_val, static_cast<ACC>(src[offset + i]));
+    }
+
+    __shared__ ACC shr[BLOCK_SIZE];
+    shr[tid] = max_val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shr[tid] = maxg(shr[tid], shr[tid + s]);
+        }
+        __syncthreads();
+    }
+    ACC row_max = shr[0];
+    __syncthreads();
+
+    ACC sum_exp = 0.0;
+    for (size_t i = tid; i < num_classes; i += blockDim.x) {
+        sum_exp += expg(static_cast<ACC>(src[offset + i]) - row_max);
+    }
+    shr[tid] = sum_exp;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shr[tid] += shr[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        ACC row_sum_exp = shr[0];
+        uint32_t target_idx = target[row];
+        if (target_idx < num_classes) {
+            ACC target_val = static_cast<ACC>(src[offset + target_idx]);
+            dst[row] = static_cast<T>(row_max + logg(row_sum_exp) - target_val);
+        } else {
+            dst[row] = static_cast<T>(NAN);
+        }
+    }
+}
+
+template <typename T, typename ACC>
+__device__ void cross_entropy_backward(
+    const size_t numel,
+    const size_t num_classes,
+    const T *src,
+    const uint32_t *target,
+    const T *grad_res,
+    T *dst)
+{
+    const size_t row = blockIdx.x;
+    const size_t tid = threadIdx.x;
+    const size_t offset = row * num_classes;
+
+    ACC max_val = -INFINITY;
+    for (size_t i = tid; i < num_classes; i += blockDim.x) {
+        max_val = maxg(max_val, static_cast<ACC>(src[offset + i]));
+    }
+
+    __shared__ ACC shr[BLOCK_SIZE];
+    shr[tid] = max_val;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shr[tid] = maxg(shr[tid], shr[tid + s]);
+        }
+        __syncthreads();
+    }
+    ACC row_max = shr[0];
+    __syncthreads();
+
+    ACC sum_exp = 0.0;
+    for (size_t i = tid; i < num_classes; i += blockDim.x) {
+        sum_exp += expg(static_cast<ACC>(src[offset + i]) - row_max);
+    }
+    shr[tid] = sum_exp;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shr[tid] += shr[tid + s];
+        }
+        __syncthreads();
+    }
+
+    ACC row_sum_exp = shr[0];
+    ACC inv_sum = 1.0 / row_sum_exp;
+    uint32_t target_idx = target[row];
+    ACC grad_scale = static_cast<ACC>(grad_res[row]);
+    const bool target_valid = target_idx < num_classes;
+
+    for (size_t i = tid; i < num_classes; i += blockDim.x) {
+        if (target_valid) {
+            ACC grad = expg(static_cast<ACC>(src[offset + i]) - row_max) * inv_sum;
+            if (i == target_idx) {
+                grad -= 1.0;
+            }
+            dst[offset + i] = static_cast<T>(grad * grad_scale);
+        } else {
+            dst[offset + i] = static_cast<T>(NAN);
+        }
+    }
+}
+
+#define CROSS_ENTROPY_OP(TYPENAME, ACC_TYPENAME, FWD_NAME, BWD_NAME) \
+  extern "C" __global__ void FWD_NAME( \
+      const size_t numel, const size_t num_classes, \
+      const TYPENAME *src, const uint32_t *target, TYPENAME *dst) { \
+    cross_entropy_forward<TYPENAME, ACC_TYPENAME>(numel, num_classes, src, target, dst); \
+  } \
+  extern "C" __global__ void BWD_NAME( \
+      const size_t numel, const size_t num_classes, \
+      const TYPENAME *src, const uint32_t *target, \
+      const TYPENAME *grad_res, TYPENAME *dst) { \
+    cross_entropy_backward<TYPENAME, ACC_TYPENAME>(numel, num_classes, src, target, grad_res, dst); \
+  }
+
 #if __CUDA_ARCH__ >= 800
+CROSS_ENTROPY_OP(__nv_bfloat16, float, cross_entropy_fwd_bf16, cross_entropy_bwd_bf16)
 SOFTMAX_OP(__nv_bfloat16, float, softmax_bf16)
 RMSNORM_OP(__nv_bfloat16, rmsnorm_bf16)
 LAYERNORM_OP(__nv_bfloat16, layernorm_bf16)
@@ -665,6 +795,7 @@ FAST_OP(__nv_bfloat16, fast_min_bf16, fast_max_bf16, fast_argmin_bf16, fast_argm
 #endif
 
 #if __CUDA_ARCH__ >= 530
+CROSS_ENTROPY_OP(__half, float, cross_entropy_fwd_f16, cross_entropy_bwd_f16)
 SOFTMAX_OP(__half, float, softmax_f16)
 RMSNORM_OP(__half, rmsnorm_f16)
 LAYERNORM_OP(__half, layernorm_f16)
@@ -677,7 +808,9 @@ SUM_OP(float, sum_f32)
 SUM_OP(double, sum_f64)
 SUM_OP(uint32_t, sum_u32)
 SOFTMAX_OP(float, float, softmax_f32)
+CROSS_ENTROPY_OP(float, float, cross_entropy_fwd_f32, cross_entropy_bwd_f32)
 SOFTMAX_OP(double, double, softmax_f64)
+CROSS_ENTROPY_OP(double, double, cross_entropy_fwd_f64, cross_entropy_bwd_f64)
 RMSNORM_OP(float, rmsnorm_f32)
 RMSNORM_OP(double, rmsnorm_f64)
 LAYERNORM_OP(float, layernorm_f32)
